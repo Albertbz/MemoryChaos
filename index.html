@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Memory Chaos</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+  <h1>Memory Chaos</h1>
+  <div style="display: flex; justify-content: center; align-items: center; gap: 48px; margin-top: 32px;">
+    <div id="grid"></div>
+    <div id="controls" style="display: flex; flex-direction: column; align-items: center;">
+      <div style="margin-bottom: 12px;">Choose LEGO brick:</div>
+      <div style="display: flex; gap: 12px;">
+        <button class="color-btn" data-color="#FFFFFF" title="White"
+          style="width:48px;height:48px;padding:0;border:none;cursor:pointer;background:none;">
+          <span
+            style="display:inline-block;width:48px;height:48px;background-color:#FFFFFF;border-radius:6px;position:relative;overflow:hidden;">
+            <img src="brick2x2.jpeg"
+              style="width:100%;height:100%;position:absolute;left:0;top:0;mix-blend-mode:multiply;filter:brightness(1);pointer-events:none;" />
+          </span>
+        </button>
+        <button class="color-btn" data-color="#FFEB3B" title="Yellow"
+          style="width:48px;height:48px;padding:0;border:none;cursor:pointer;background:none;">
+          <span
+            style="display:inline-block;width:48px;height:48px;background-color:#FFEB3B;border-radius:6px;position:relative;overflow:hidden;">
+            <img src="brick2x2.jpeg"
+              style="width:100%;height:100%;position:absolute;left:0;top:0;mix-blend-mode:multiply;filter:brightness(1);pointer-events:none;" />
+          </span>
+        </button>
+        <button class="color-btn" data-color="#1E88E5" title="Blue"
+          style="width:48px;height:48px;padding:0;border:none;cursor:pointer;background:none;">
+          <span
+            style="display:inline-block;width:48px;height:48px;background-color:#1E88E5;border-radius:6px;position:relative;overflow:hidden;">
+            <img src="brick2x2.jpeg"
+              style="width:100%;height:100%;position:absolute;left:0;top:0;mix-blend-mode:multiply;filter:brightness(1);pointer-events:none;" />
+          </span>
+        </button>
+        <button class="color-btn" data-color="#E53935" title="Red"
+          style="width:48px;height:48px;padding:0;border:none;cursor:pointer;background:none;">
+          <span
+            style="display:inline-block;width:48px;height:48px;background-color:#E53935;border-radius:6px;position:relative;overflow:hidden;">
+            <img src="brick2x2.jpeg"
+              style="width:100%;height:100%;position:absolute;left:0;top:0;mix-blend-mode:multiply;filter:brightness(1);pointer-events:none;" />
+          </span>
+        </button>
+      </div>
+    </div>
+  </div>
+  <script src="script.js"></script>
+</body>
+
+</html>
