@@ -60,6 +60,8 @@ for (let row = 0; row < gridSize; row++) {
   for (let col = 0; col < gridSize; col++) {
     const square = document.createElement('div');
     square.className = 'square';
+    square.dataset.r = row;
+    square.dataset.c = col;
 
     // Add an img element for toggling
     const img = document.createElement('img');
@@ -77,11 +79,20 @@ for (let row = 0; row < gridSize; row++) {
       e.preventDefault();
       isPainting = true;
       toggleSquare(square, img);
+      // send cell update via websocket if available
+      const r = Number(square.dataset.r);
+      const c = Number(square.dataset.c);
+      const color = square.classList.contains('has-image') ? (square.style.backgroundColor || null) : null;
+      sendCellUpdate(r, c, color);
     });
 
     square.addEventListener('mouseover', () => {
       if (isPainting) {
         toggleSquare(square, img);
+        const r = Number(square.dataset.r);
+        const c = Number(square.dataset.c);
+        const color = square.classList.contains('has-image') ? (square.style.backgroundColor || null) : null;
+        sendCellUpdate(r, c, color);
       }
     });
 
@@ -95,6 +106,31 @@ for (let row = 0; row < gridSize; row++) {
 document.addEventListener('mouseup', () => {
   isPainting = false;
 });
+
+// WebSocket helper
+let ws = null;
+function ensureWebSocket() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return ws;
+  const espIp = localStorage.getItem('espIp');
+  if (!espIp) return null;
+  try {
+    ws = new WebSocket(`ws://${espIp}:81`);
+    ws.addEventListener('open', () => console.log('WebSocket open'));
+    ws.addEventListener('close', () => console.log('WebSocket closed'));
+    ws.addEventListener('error', (e) => console.error('WebSocket error', e));
+  } catch (e) {
+    console.error('Failed to create WebSocket', e);
+    ws = null;
+  }
+  return ws;
+}
+
+function sendCellUpdate(r, c, color) {
+  const socket = ensureWebSocket();
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const msg = JSON.stringify({ type: 'cell', r, c, color });
+  socket.send(msg);
+}
 
 // Return a 2D array representing the grid state: null for empty, or color string for filled
 function getGridState() {
@@ -126,9 +162,38 @@ function getGridState() {
 document.addEventListener('DOMContentLoaded', () => {
   const sendBtn = document.getElementById('sendChaos');
   if (sendBtn) {
-    sendBtn.addEventListener('click', () => {
-      console.log('Grid state (rows x cols):', gridSize, 'x', gridSize);
-      console.log(getGridState());
+    sendBtn.addEventListener('click', async () => {
+      // Ask for ESP IP (use stored value if available)
+      let espIp = localStorage.getItem('espIp') || '';
+      if (!espIp) {
+        espIp = prompt('Enter ESP32 IP (e.g. 192.168.1.123):');
+        if (!espIp) return;
+        localStorage.setItem('espIp', espIp);
+      }
+
+      const state = getGridState();
+      console.log('Sending grid to ESP at', espIp);
+
+      const originalText = sendBtn.textContent;
+      sendBtn.textContent = 'Sending...';
+      sendBtn.disabled = true;
+
+      try {
+        const res = await fetch(`http://${espIp}/grid`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ grid: state })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const json = await res.json();
+        console.log('ESP response', json);
+        sendBtn.textContent = 'Sent ✓';
+        setTimeout(() => { sendBtn.textContent = originalText; sendBtn.disabled = false; }, 1200);
+      } catch (err) {
+        console.error('Failed to send grid to ESP:', err);
+        sendBtn.textContent = 'Failed';
+        setTimeout(() => { sendBtn.textContent = originalText; sendBtn.disabled = false; }, 1500);
+      }
     });
   }
 });
