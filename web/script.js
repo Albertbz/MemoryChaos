@@ -95,3 +95,40 @@ for (let row = 0; row < gridSize; row++) {
 document.addEventListener('mouseup', () => {
   isPainting = false;
 });
+
+// Return a 2D array representing the grid state: null for empty, or color string for filled
+function getGridState() {
+  const squares = Array.from(grid.querySelectorAll('.square'));
+  const state = [];
+  for (let r = 0; r < gridSize; r++) {
+    const row = [];
+    for (let c = 0; c < gridSize; c++) {
+      const idx = r * gridSize + c;
+      const sq = squares[idx];
+      if (!sq) {
+        row.push(null);
+        continue;
+      }
+      if (sq.classList.contains('has-image')) {
+        // Use the inline backgroundColor if present; normalize empty string to null
+        const col = sq.style.backgroundColor || null;
+        row.push(col);
+      } else {
+        row.push(null);
+      }
+    }
+    state.push(row);
+  }
+  return state;
+}
+
+// Wire the Send chaos button to print the grid state after DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+  const sendBtn = document.getElementById('sendChaos');
+  if (sendBtn) {
+    sendBtn.addEventListener('click', () => {
+      console.log('Grid state (rows x cols):', gridSize, 'x', gridSize);
+      console.log(getGridState());
+    });
+  }
+});

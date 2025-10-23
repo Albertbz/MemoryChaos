@@ -38,20 +38,49 @@
   z-index: 2;
 }
 
+/* Send button styling */
+#sendChaos {
+  font-weight: 600;
+}
+
 body {
   font-family: Arial, sans-serif;
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
+  /* vertically center content */
   background: #f0f0f0;
 }
+
+/* Reset default browser margin and ensure main wrapper centers */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+#main {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  /* top-align controls with the grid */
+  gap: 48px;
+  margin-top: 32px;
+  width: max-content;
+  /* shrink to fit grid + controls */
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Debug outlines removed */
 
 #grid {
   display: grid;
   grid-template-columns: repeat(16, 30px);
   grid-template-rows: repeat(16, 30px);
   gap: 0;
-  margin-top: 20px;
   background-image: url('baseplate.jpeg');
   background-size: cover;
   background-position: center;
@@ -94,4 +123,47 @@ body {
 /* Show faint square only on hover if there is no image */
 .square:hover:not(.has-image) {
   background: rgba(255, 255, 255, 0.2);
+}
+
+/* Controls layout overrides for the vertical color stack and side eraser */
+#controls {
+  display: flex;
+  align-items: center;
+  /* vertical centering for inner layout */
+  gap: 12px;
+  white-space: nowrap;
+}
+
+.mode-btn img {
+  width: 34px;
+  height: 34px;
+}
+
+.color-btn {
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border: none;
+  cursor: pointer;
+  background: none;
+}
+
+#eraseBtn {
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.mode-btn {
+  width: 96px;
+  height: 48px;
+  padding: 6px;
+  border: none;
+  cursor: pointer;
+  background: #fff;
+  border-radius: 6px;
 }
