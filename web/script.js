@@ -10,6 +10,10 @@ colorButtons.forEach(btn => {
     currentColor = btn.getAttribute('data-color');
     colorButtons.forEach(b => b.classList.remove('selected'));
     btn.classList.add('selected');
+    // Selecting a color switches back to draw mode
+    currentMode = 'draw';
+    const eraseBtn = document.getElementById('eraseBtn');
+    if (eraseBtn) eraseBtn.classList.remove('selected');
   });
 });
 // Select the white button by default
@@ -18,15 +22,33 @@ if (whiteBtn) {
   whiteBtn.classList.add('selected');
 }
 
+// Mode buttons
+let currentMode = 'draw'; // or 'erase'
+const eraseBtn = document.getElementById('eraseBtn');
+if (eraseBtn) {
+  eraseBtn.addEventListener('click', () => {
+    if (currentMode === 'erase') {
+      currentMode = 'draw';
+      eraseBtn.classList.remove('selected');
+    } else {
+      currentMode = 'erase';
+      eraseBtn.classList.add('selected');
+      // clear color selection when entering erase
+      colorButtons.forEach(b => b.classList.remove('selected'));
+    }
+  });
+}
+
 function toggleSquare(square, img) {
-  if (img.style.display === 'none') {
+  if (currentMode === 'draw') {
+    // Draw mode: show and tint
     img.style.display = 'block';
     square.classList.add('has-image');
-    // Tint the image using background and blend mode
     square.style.backgroundColor = currentColor;
     img.style.mixBlendMode = 'multiply';
     img.style.filter = 'none';
-  } else {
+  } else if (currentMode === 'erase') {
+    // Erase mode: hide image and clear tint
     img.style.display = 'none';
     square.classList.remove('has-image');
     square.style.backgroundColor = '';
