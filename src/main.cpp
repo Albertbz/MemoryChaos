@@ -11,7 +11,8 @@
 const char* ssid = "OnePlus 8";
 const char* password = "Streym2002";
 
-WebServer server(80);
+// Use port 8080 for HTTP to avoid carrier/hotspot port blocking on port 80
+WebServer server(8080);
 WebSocketsServer webSocket = WebSocketsServer(81);
 
 const int GRID_SIZE = 16;
@@ -73,6 +74,20 @@ void handleGridPost() {
     }
 
     server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+// Simple status endpoint to help the web client perform reachability checks
+void handleStatus() {
+    sendCorsHeaders();
+    if (WiFi.status() == WL_CONNECTED) {
+        String ip = WiFi.localIP().toString();
+        String payload =
+            String("{\"status\":\"ok\",\"ip\":\"") + ip + String("\"}");
+        server.send(200, "application/json", payload);
+    } else {
+        server.send(200, "application/json",
+                    "{\"status\":\"offline\",\"ip\":\"\"}");
+    }
 }
 
 // Helper to print grid (used from websocket handlers too)
@@ -149,18 +164,50 @@ void setup() {
     WiFi.begin(ssid, password);
     Serial.println("\nConnecting to WiFi Network ..");
 
-    server.on("/grid", HTTP_OPTIONS, handleOptions);
-    server.on("/grid", HTTP_POST, handleGridPost);
-    server.begin();
-    Serial.println("HTTP server started");
+    // Wait for WiFi with timeout so server starts after IP is assigned
+    const unsigned long wifiTimeout = 15000;  // ms
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < wifiTimeout) {
+        delay(200);
+        Serial.print('.');
+    }
+    Serial.println();
 
-    // Start WebSocket server
-    webSocket.begin();
-    webSocket.onEvent(onWebSocketEvent);
-    Serial.println("WebSocket server started on port 81");
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("Connected — IP: ");
+        Serial.println(WiFi.localIP());
+
+        // Start HTTP server routes after WiFi is up
+        server.on("/grid", HTTP_OPTIONS, handleOptions);
+        server.on("/grid", HTTP_POST, handleGridPost);
+        server.on("/status", HTTP_GET, handleStatus);
+        server.begin();
+        Serial.println("HTTP server started");
+
+        // Start WebSocket server
+        webSocket.begin();
+        webSocket.onEvent(onWebSocketEvent);
+        Serial.println("WebSocket server started on port 81");
+    } else {
+        Serial.println(
+            "WiFi connect timed out — servers not started. Check "
+            "credentials/network.");
+        // Still set up routes so HTTP might work if IP becomes available later
+        server.on("/grid", HTTP_OPTIONS, handleOptions);
+        server.on("/grid", HTTP_POST, handleGridPost);
+        server.on("/status", HTTP_GET, handleStatus);
+    }
 }
 
 void loop() {
     server.handleClient();
     webSocket.loop();
+
+    // Periodic status output to help debugging connectivity
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 5000) {
+        lastPrint = millis();
+        Serial.print("WiFi status: ");
+        Serial.println(WiFi.status());
+    }
 }

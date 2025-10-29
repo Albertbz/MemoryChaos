@@ -111,10 +111,14 @@ document.addEventListener('mouseup', () => {
 let ws = null;
 function ensureWebSocket() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return ws;
-  const espIp = localStorage.getItem('espIp');
+  const ipInput = document.getElementById('espIpInput');
+  let espIp = null;
+  if (ipInput && ipInput.value && ipInput.value.trim()) espIp = ipInput.value.trim();
   if (!espIp) return null;
   try {
-    ws = new WebSocket(`ws://${espIp}:81`);
+    // if user provided a port (e.g. 10.0.0.5:8080), strip it for websocket host
+    const host = espIp.split(':')[0];
+    ws = new WebSocket(`ws://${host}:81`);
     ws.addEventListener('open', () => console.log('WebSocket open'));
     ws.addEventListener('close', () => console.log('WebSocket closed'));
     ws.addEventListener('error', (e) => console.error('WebSocket error', e));
@@ -160,16 +164,86 @@ function getGridState() {
 
 // Wire the Send chaos button to print the grid state after DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
+  // ESP IP input and Test connection
+  const espIpInput = document.getElementById('espIpInput');
+  const testBtn = document.getElementById('testEspBtn');
+  const espStatus = document.getElementById('espStatus');
+  if (espIpInput) {
+    const saved = localStorage.getItem('espIp');
+    if (saved) espIpInput.value = saved;
+    espIpInput.addEventListener('change', () => {
+      localStorage.setItem('espIp', espIpInput.value.trim());
+    });
+  }
+
+  async function checkEspReachable(ip) {
+    if (!ip) return false;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000);
+      // Probe the simpler /status endpoint (GET) which we add to the ESP firmware.
+      let res = null;
+      try {
+        if (ip.includes(':')) {
+          // user supplied host:port
+          res = await fetch(`http://${ip}/status`, { method: 'GET', signal: controller.signal });
+        } else {
+          // try default port (80) first, then fallback to 8080
+          try {
+            res = await fetch(`http://${ip}/status`, { method: 'GET', signal: controller.signal });
+          } catch (e) {
+            console.debug('Primary /status failed, trying :8080', e);
+            res = await fetch(`http://${ip}:8080/status`, { method: 'GET', signal: controller.signal });
+          }
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+      if (!res) return false;
+      if (!res.ok) return false;
+      // Optionally validate JSON body
+      try {
+        const j = await res.json();
+        return j && (j.status === 'ok' || j.status === 'offline' || j.status === 'ok');
+      } catch (e) {
+        return true; // reachable even if JSON parsing failed
+      }
+    } catch (e) {
+      console.debug('checkEspReachable error', e);
+      return false;
+    }
+  }
+
+  if (testBtn) {
+    testBtn.addEventListener('click', async () => {
+      const ip = (espIpInput && espIpInput.value.trim()) || localStorage.getItem('espIp') || '';
+      if (!ip) { alert('Enter an ESP IP first'); return; }
+      testBtn.textContent = 'Testing...'; testBtn.disabled = true;
+      const ok = await checkEspReachable(ip);
+      testBtn.disabled = false; testBtn.textContent = 'Test connection';
+      if (espStatus) {
+        if (ok) { espStatus.textContent = `Reachable (${ip})`; espStatus.style.color = 'green'; ensureWebSocket(); localStorage.setItem('espIp', ip); }
+        else { espStatus.textContent = `Unreachable (${ip})`; espStatus.style.color = 'crimson'; }
+      }
+    });
+  }
+
   const sendBtn = document.getElementById('sendChaos');
   if (sendBtn) {
     sendBtn.addEventListener('click', async () => {
-      // Ask for ESP IP (use stored value if available)
-      let espIp = localStorage.getItem('espIp') || '';
+      // Prefer IP from input, otherwise stored value or prompt
+      let espIp = '';
+      if (espIpInput && espIpInput.value.trim()) espIp = espIpInput.value.trim();
+      if (!espIp) espIp = localStorage.getItem('espIp') || '';
       if (!espIp) {
         espIp = prompt('Enter ESP32 IP (e.g. 192.168.1.123):');
         if (!espIp) return;
         localStorage.setItem('espIp', espIp);
       }
+
+      // quick reachability check
+      const reachable = await checkEspReachable(espIp);
+      if (!reachable) { alert(`Cannot reach ESP at ${espIp}. Check network and IP.`); return; }
 
       const state = getGridState();
       console.log('Sending grid to ESP at', espIp);
@@ -179,12 +253,32 @@ document.addEventListener('DOMContentLoaded', () => {
       sendBtn.disabled = true;
 
       try {
-        const res = await fetch(`http://${espIp}/grid`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ grid: state })
-        });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
+        // Try default (may include port if user typed ip:port)
+        let postUrls = [];
+        if (espIp.includes(':')) postUrls.push(`http://${espIp}/grid`);
+        else {
+          postUrls.push(`http://${espIp}/grid`);
+          postUrls.push(`http://${espIp}:8080/grid`);
+        }
+
+        let res = null;
+        let lastErr = null;
+        for (const url of postUrls) {
+          try {
+            res = await fetch(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ grid: state })
+            });
+            if (res.ok) break; // success
+            lastErr = new Error('HTTP ' + res.status);
+          } catch (e) {
+            lastErr = e;
+            res = null;
+          }
+        }
+
+        if (!res || !res.ok) throw lastErr || new Error('Failed to POST to any URL');
         const json = await res.json();
         console.log('ESP response', json);
         sendBtn.textContent = 'Sent ✓';
