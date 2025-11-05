@@ -151,7 +151,25 @@ function getGridState() {
       }
       if (sq.classList.contains('has-image')) {
         // Use the inline backgroundColor if present; normalize empty string to null
-        const col = sq.style.backgroundColor || null;
+        // Convert rgb(...) strings to compact hex (#RRGGBB) to reduce payload size
+        const colRaw = sq.style.backgroundColor || null;
+        let col = null;
+        if (colRaw) {
+          // colRaw may be like "rgb(255, 255, 255)" or "rgba(...)" or "#ffffff"
+          if (colRaw.startsWith('rgb')) {
+            // extract numbers
+            const nums = colRaw.replace(/rgba?\(|\s|\)/g, '').split(',');
+            if (nums.length >= 3) {
+              const r = parseInt(nums[0], 10) || 0;
+              const g = parseInt(nums[1], 10) || 0;
+              const b = parseInt(nums[2], 10) || 0;
+              const toHex = (v) => ('0' + (v & 0xFF).toString(16)).slice(-2);
+              col = '#' + toHex(r) + toHex(g) + toHex(b);
+            }
+          } else {
+            col = colRaw; // already hex or other format
+          }
+        }
         row.push(col);
       } else {
         row.push(null);
@@ -246,7 +264,64 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!reachable) { alert(`Cannot reach ESP at ${espIp}. Check network and IP.`); return; }
 
       const state = getGridState();
+      // Client-side validation to avoid sending malformed grids
+      if (!Array.isArray(state) || state.length !== gridSize) {
+        console.error('Grid state invalid: wrong number of rows', state.length);
+        alert('Grid is invalid (wrong number of rows). Please reload the page.');
+        return;
+      }
+      for (let r = 0; r < state.length; r++) {
+        if (!Array.isArray(state[r]) || state[r].length !== gridSize) {
+          console.error('Grid state invalid: row', r, 'length', state[r] && state[r].length);
+          alert(`Grid is invalid (row ${r} length). Please reload the page.`);
+          return;
+        }
+        for (let c = 0; c < state[r].length; c++) {
+          const v = state[r][c];
+          if (v !== null && typeof v !== 'string') {
+            console.error('Grid state invalid: row', r, 'col', c, 'value', v);
+            alert(`Grid contains invalid value at ${r},${c}.`);
+            return;
+          }
+          if (typeof v === 'string' && v.length > 64) {
+            console.error('Grid state invalid: string too long at', r, c, v.length);
+            alert(`Grid contains too-long color string at ${r},${c}.`);
+            return;
+          }
+        }
+      }
+
+      // Build a compact payload: palette + 256-char map (one char per cell)
+      // This reduces JSON size dramatically compared to full strings.
+      const palette = [];
+      const paletteIndex = {};
+      function idxChar(i) {
+        const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+        return chars[i] || '?';
+      }
+      function ensurePalette(color) {
+        if (color === null) return null;
+        if (paletteIndex.hasOwnProperty(color)) return paletteIndex[color];
+        const i = palette.length;
+        palette.push(color);
+        paletteIndex[color] = i;
+        return i;
+      }
+      let compact = ''; // length should be gridSize*gridSize (256)
+      for (let r = 0; r < gridSize; r++) {
+        for (let c = 0; c < gridSize; c++) {
+          const v = state[r][c];
+          if (v === null) compact += '.';
+          else {
+            const i = ensurePalette(v);
+            compact += idxChar(i);
+          }
+        }
+      }
+      const payload = { compact, palette };
+      const payloadStr = JSON.stringify(payload);
       console.log('Sending grid to ESP at', espIp);
+      console.debug('Grid payload:', payloadStr);
 
       const originalText = sendBtn.textContent;
       sendBtn.textContent = 'Sending...';
@@ -268,10 +343,13 @@ document.addEventListener('DOMContentLoaded', () => {
             res = await fetch(url, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ grid: state })
+              body: payloadStr
             });
             if (res.ok) break; // success
-            lastErr = new Error('HTTP ' + res.status);
+            // read server error body when available
+            let errBody = null;
+            try { errBody = await res.text(); } catch (e) { errBody = null; }
+            lastErr = new Error('HTTP ' + res.status + (errBody ? (': ' + errBody) : ''));
           } catch (e) {
             lastErr = e;
             res = null;
@@ -279,7 +357,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (!res || !res.ok) throw lastErr || new Error('Failed to POST to any URL');
-        const json = await res.json();
+        let json = null;
+        try { json = await res.json(); } catch (e) { json = { status: 'ok' }; }
         console.log('ESP response', json);
         sendBtn.textContent = 'Sent ✓';
         setTimeout(() => { sendBtn.textContent = originalText; sendBtn.disabled = false; }, 1200);
