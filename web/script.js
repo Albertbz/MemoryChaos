@@ -82,7 +82,9 @@ for (let row = 0; row < gridSize; row++) {
       // send cell update via websocket if available
       const r = Number(square.dataset.r);
       const c = Number(square.dataset.c);
-      const color = square.classList.contains('has-image') ? (square.style.backgroundColor || null) : null;
+      // Use the current selected color (canonical from the buttons) so the
+      // websocket receives a consistent hex string instead of browser rgb(...)
+      const color = square.classList.contains('has-image') ? getSelectedColorName() : null;
       sendCellUpdate(r, c, color);
     });
 
@@ -91,7 +93,7 @@ for (let row = 0; row < gridSize; row++) {
         toggleSquare(square, img);
         const r = Number(square.dataset.r);
         const c = Number(square.dataset.c);
-        const color = square.classList.contains('has-image') ? (square.style.backgroundColor || null) : null;
+        const color = square.classList.contains('has-image') ? getSelectedColorName() : null;
         sendCellUpdate(r, c, color);
       }
     });
@@ -134,6 +136,14 @@ function sendCellUpdate(r, c, color) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   const msg = JSON.stringify({ type: 'cell', r, c, color });
   socket.send(msg);
+}
+
+// Return the selected color's title/name (fallback to data-color when title
+// not present). This ensures websocket updates send names like "Red".
+function getSelectedColorName() {
+  const sel = document.querySelector('.color-btn.selected');
+  if (sel) return sel.getAttribute('title') || sel.getAttribute('data-color');
+  return null;
 }
 
 // Return a 2D array representing the grid state: null for empty, or color string for filled
@@ -295,16 +305,27 @@ document.addEventListener('DOMContentLoaded', () => {
       // This reduces JSON size dramatically compared to full strings.
       const palette = [];
       const paletteIndex = {};
+      // Build a map from hex (data-color) to the button title (color name)
+      const colorNameMap = {};
+      colorButtons.forEach(btn => {
+        const col = (btn.getAttribute('data-color') || '').toLowerCase();
+        const title = btn.getAttribute('title') || btn.title || '';
+        if (col) colorNameMap[col] = title || col;
+      });
       function idxChar(i) {
         const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
         return chars[i] || '?';
       }
       function ensurePalette(color) {
         if (color === null) return null;
-        if (paletteIndex.hasOwnProperty(color)) return paletteIndex[color];
+        const key = (typeof color === 'string') ? color.toLowerCase() : color;
+        // Prefer to send the color name (button title) when available
+        const name = (typeof key === 'string' && colorNameMap.hasOwnProperty(key)) ? colorNameMap[key] : null;
+        const paletteKey = name || key;
+        if (paletteIndex.hasOwnProperty(paletteKey)) return paletteIndex[paletteKey];
         const i = palette.length;
-        palette.push(color);
-        paletteIndex[color] = i;
+        palette.push(name || color);
+        paletteIndex[paletteKey] = i;
         return i;
       }
       let compact = ''; // length should be gridSize*gridSize (256)

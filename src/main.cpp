@@ -27,8 +27,7 @@ void handleLed();
 const char* ssid = "OnePlus 8";
 const char* password = "Streym2002";
 
-// Use port 8080 for HTTP to avoid carrier/hotspot port blocking on port 80
-WebServer server(8080);
+WebServer server(80);
 WebSocketsServer webSocket = WebSocketsServer(81);
 
 const int GRID_SIZE = 16;
@@ -36,6 +35,7 @@ String gridState[GRID_SIZE][GRID_SIZE];
 
 // Forward declarations
 void printGridToSerial();
+String normalizeColorString(const String& in);
 
 void sendCorsHeaders() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -46,6 +46,39 @@ void sendCorsHeaders() {
 void handleOptions() {
     sendCorsHeaders();
     server.send(204);
+}
+
+// Scan the gridState and turn on LEDs for colors that are present.
+// Mapping: pin 13 -> red, pin 12 -> blue, pin 14 -> yellow
+void updateLedsFromGrid() {
+    // Only use the incoming color names (e.g. "Red", "Blue", "Yellow")
+    // to decide which LEDs to light. This assumes the client sends names for
+    // both compact palettes and websocket cell updates.
+    bool redUsed = false;
+    bool blueUsed = false;
+    bool yellowUsed = false;
+
+    for (int r = 0; r < GRID_SIZE; ++r) {
+        for (int c = 0; c < GRID_SIZE; ++c) {
+            const String& s = gridState[r][c];
+            if (s.length() == 0) continue;
+            String low = s;
+            low.toLowerCase();
+            if (low.indexOf("red") >= 0) redUsed = true;
+            if (low.indexOf("blue") >= 0) blueUsed = true;
+            if (low.indexOf("yellow") >= 0) yellowUsed = true;
+            if (redUsed && blueUsed && yellowUsed) break;
+        }
+        if (redUsed && blueUsed && yellowUsed) break;
+    }
+
+    digitalWrite(LED_PINS[0], redUsed ? HIGH : LOW);
+    digitalWrite(LED_PINS[1], blueUsed ? HIGH : LOW);
+    digitalWrite(LED_PINS[2], yellowUsed ? HIGH : LOW);
+
+    Serial.printf("updateLedsFromGrid -> red:%s blue:%s yellow:%s\n",
+                  redUsed ? "ON" : "OFF", blueUsed ? "ON" : "OFF",
+                  yellowUsed ? "ON" : "OFF");
 }
 
 void handleGridPost() {
@@ -109,10 +142,14 @@ void handleGridPost() {
         if (doc.containsKey("palette") && doc["palette"].is<JsonArray>()) {
             JsonArray parr = doc["palette"].as<JsonArray>();
             for (size_t i = 0; i < parr.size(); ++i) {
-                if (parr[i].is<const char*>())
-                    pal.push_back(String((const char*)parr[i]));
-                else
+                if (parr[i].is<const char*>()) {
+                    String raw = String((const char*)parr[i]);
+                    // Normalize palette entries: prefer mapping names to hex
+                    String norm = normalizeColorString(raw);
+                    pal.push_back(norm);
+                } else {
                     pal.push_back(String(""));
+                }
             }
         }
 
@@ -155,6 +192,7 @@ void handleGridPost() {
         }
 
         printGridToSerial();
+        updateLedsFromGrid();
         server.send(200, "application/json", "{\"status\":\"ok\"}");
         return;
     }
@@ -206,7 +244,11 @@ void handleGridPost() {
                     server.send(400, "text/plain", "Color string too long");
                     return;
                 }
-                gridState[r][c] = String(s);
+                String col = String(s);
+                // Normalize color names like "Red" -> "#e53935", and normalize
+                // hex
+                col = normalizeColorString(col);
+                gridState[r][c] = col;
             } else {
                 // Not a string or null
                 Serial.printf("POST /grid row %d col %d invalid value type\n",
@@ -226,7 +268,7 @@ void handleGridPost() {
         }
         Serial.println(line);
     }
-
+    updateLedsFromGrid();
     server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
@@ -250,6 +292,38 @@ const char* getLedColorName(int pin) {
     if (pin == 12) return "blue";
     if (pin == 14) return "yellow";
     return "unknown";
+}
+
+// Normalize color strings: map known color names to canonical hex used by the
+// client, normalize hex to lowercase and expand short form (#RGB) to #RRGGBB.
+String normalizeColorString(const String& in) {
+    String s = in;
+    s.trim();
+    if (s.length() == 0) return s;
+    // If hex, normalize to lowercase and expand short form
+    if (s.charAt(0) == '#') {
+        s.toLowerCase();
+        if (s.length() == 4) {
+            // #RGB -> #RRGGBB
+            char r = s.charAt(1);
+            char g = s.charAt(2);
+            char b = s.charAt(3);
+            String out = "#";
+            out += String(r);
+            out += String(r);
+            out += String(g);
+            out += String(g);
+            out += String(b);
+            out += String(b);
+            out.toLowerCase();
+            return out;
+        }
+        return s;
+    }
+    // For non-hex input (e.g. "Red", "Blue"), preserve the incoming value
+    // as-is (trimmed). This lets the incoming palette use names instead of
+    // being converted to hex.
+    return s;
 }
 
 // HTTP handler for /led
@@ -428,11 +502,15 @@ void onWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t* payload,
                 if (doc["color"].isNull()) {
                     gridState[r][c] = "";
                 } else {
-                    gridState[r][c] = String((const char*)doc["color"]);
+                    String col = String((const char*)doc["color"]);
+                    col = normalizeColorString(col);
+                    gridState[r][c] = col;
                 }
                 // For feedback, print the updated row
                 Serial.printf("WS cell update: r=%d c=%d color=%s\n", r, c,
                               gridState[r][c].c_str());
+                // Update LEDs because a cell changed
+                updateLedsFromGrid();
             }
         } else if (strcmp(typeStr, "full") == 0) {
             if (!doc.containsKey("grid")) return;
@@ -447,6 +525,7 @@ void onWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t* payload,
                 }
             }
             printGridToSerial();
+            updateLedsFromGrid();
         }
     }
 }
