@@ -256,6 +256,35 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // Handle Push Magnets button
+  const pushBtn = document.getElementById('pushMagnets');
+  if (pushBtn) {
+    pushBtn.addEventListener('click', async () => {
+      let espIp = '';
+      if (espIpInput && espIpInput.value.trim()) espIp = espIpInput.value.trim();
+      if (!espIp) espIp = localStorage.getItem('espIp') || '';
+      if (!espIp) {
+        espIp = prompt('Enter ESP32 IP (e.g. 192.168.1.123):');
+        if (!espIp) return;
+        localStorage.setItem('espIp', espIp);
+      }
+
+      // Send a POST request to /push-magnets on the ESP
+      if (espIp) {
+        try {
+          const res = await fetch(`http://${espIp}/push-magnets`, { method: 'POST' });
+          if (res.ok) {
+            alert('Magnets pushed successfully!');
+          } else {
+            alert('Failed to push magnets. ESP responded with status ' + res.status);
+          }
+        } catch (e) {
+          alert('Error pushing magnets: ' + e.message);
+        }
+      }
+    });
+  }
+
   const sendBtn = document.getElementById('sendChaos');
   if (sendBtn) {
     sendBtn.addEventListener('click', async () => {

@@ -13,6 +13,7 @@
 
 // LED pins the user wants to control
 const int LED_PINS[] = {13, 12, 14};
+const int RELAY_PINS[] = {15, 2};
 const size_t LED_PIN_COUNT = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
 
 bool isAllowedLedPin(int pin) {
@@ -79,6 +80,21 @@ void updateLedsFromGrid() {
     Serial.printf("updateLedsFromGrid -> red:%s blue:%s yellow:%s\n",
                   redUsed ? "ON" : "OFF", blueUsed ? "ON" : "OFF",
                   yellowUsed ? "ON" : "OFF");
+}
+
+// Make a POST /push-magnets handler that activates the relays
+void handlePushMagnets() {
+    sendCorsHeaders();
+
+    digitalWrite(RELAY_PINS[0], HIGH);
+    digitalWrite(RELAY_PINS[1], HIGH);
+    delay(300);
+    digitalWrite(RELAY_PINS[0], LOW);
+    digitalWrite(RELAY_PINS[1], LOW);
+
+    server.send(200, "application/json", "{\"status\":\"magnets pushed\"}");
+
+    Serial.println("POST /push-magnets: Magnets pushed");
 }
 
 void handleGridPost() {
@@ -541,6 +557,14 @@ void setup() {
         digitalWrite(LED_PINS[i], LOW);
     }
 
+    pinMode(RELAY_PINS[0], OUTPUT);
+    pinMode(RELAY_PINS[1], OUTPUT);
+
+    digitalWrite(RELAY_PINS[0], HIGH);
+    digitalWrite(RELAY_PINS[1], HIGH);
+    digitalWrite(RELAY_PINS[0], LOW);
+    digitalWrite(RELAY_PINS[1], LOW);
+
     WiFi.mode(WIFI_STA);
     WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
         if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
@@ -568,6 +592,7 @@ void setup() {
         // Start HTTP server routes after WiFi is up
         server.on("/grid", HTTP_OPTIONS, handleOptions);
         server.on("/grid", HTTP_POST, handleGridPost);
+        server.on("/push-magnets", HTTP_POST, handlePushMagnets);
         server.on("/led", HTTP_GET, handleLed);
         server.on("/led", HTTP_POST, handleLed);
         server.on("/status", HTTP_GET, handleStatus);
