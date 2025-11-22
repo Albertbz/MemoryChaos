@@ -1,5 +1,5 @@
 const grid = document.getElementById('grid');
-const gridSize = 16; // 16x16 grid
+const gridSize = 5; // 5x5 grid
 let isPainting = false;
 
 // Color button logic
@@ -82,10 +82,7 @@ for (let row = 0; row < gridSize; row++) {
       // send cell update via websocket if available
       const r = Number(square.dataset.r);
       const c = Number(square.dataset.c);
-      // Use the current selected color (canonical from the buttons) so the
-      // websocket receives a consistent hex string instead of browser rgb(...)
-      const color = square.classList.contains('has-image') ? getSelectedColorName() : null;
-      sendCellUpdate(r, c, color);
+      // per-cell websocket updates disabled — user interaction only updates UI
     });
 
     square.addEventListener('mouseover', () => {
@@ -93,8 +90,7 @@ for (let row = 0; row < gridSize; row++) {
         toggleSquare(square, img);
         const r = Number(square.dataset.r);
         const c = Number(square.dataset.c);
-        const color = square.classList.contains('has-image') ? getSelectedColorName() : null;
-        sendCellUpdate(r, c, color);
+        // per-cell websocket updates disabled — user interaction only updates UI
       }
     });
 
@@ -109,34 +105,7 @@ document.addEventListener('mouseup', () => {
   isPainting = false;
 });
 
-// WebSocket helper
-let ws = null;
-function ensureWebSocket() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return ws;
-  const ipInput = document.getElementById('espIpInput');
-  let espIp = null;
-  if (ipInput && ipInput.value && ipInput.value.trim()) espIp = ipInput.value.trim();
-  if (!espIp) return null;
-  try {
-    // if user provided a port (e.g. 10.0.0.5:8080), strip it for websocket host
-    const host = espIp.split(':')[0];
-    ws = new WebSocket(`ws://${host}:81`);
-    ws.addEventListener('open', () => console.log('WebSocket open'));
-    ws.addEventListener('close', () => console.log('WebSocket closed'));
-    ws.addEventListener('error', (e) => console.error('WebSocket error', e));
-  } catch (e) {
-    console.error('Failed to create WebSocket', e);
-    ws = null;
-  }
-  return ws;
-}
-
-function sendCellUpdate(r, c, color) {
-  const socket = ensureWebSocket();
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  const msg = JSON.stringify({ type: 'cell', r, c, color });
-  socket.send(msg);
-}
+// Note: per-cell WebSocket updates removed — we only send full grid posts now.
 
 // Return the selected color's title/name (fallback to data-color when title
 // not present). This ensures websocket updates send names like "Red".
@@ -250,7 +219,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const ok = await checkEspReachable(ip);
       testBtn.disabled = false; testBtn.textContent = 'Test connection';
       if (espStatus) {
-        if (ok) { espStatus.textContent = `Reachable (${ip})`; espStatus.style.color = 'green'; ensureWebSocket(); localStorage.setItem('espIp', ip); }
+        if (ok) { espStatus.textContent = `Reachable (${ip})`; espStatus.style.color = 'green'; localStorage.setItem('espIp', ip); }
         else { espStatus.textContent = `Unreachable (${ip})`; espStatus.style.color = 'crimson'; }
       }
     });
@@ -294,13 +263,13 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!espIp) espIp = localStorage.getItem('espIp') || '';
       if (!espIp) {
         espIp = prompt('Enter ESP32 IP (e.g. 192.168.1.123):');
-        if (!espIp) return;
+        // if (!espIp) return;
         localStorage.setItem('espIp', espIp);
       }
 
       // quick reachability check
       const reachable = await checkEspReachable(espIp);
-      if (!reachable) { alert(`Cannot reach ESP at ${espIp}. Check network and IP.`); return; }
+      // if (!reachable) { alert(`Cannot reach ESP at ${espIp}. Check network and IP.`); return; }
 
       const state = getGridState();
       // Client-side validation to avoid sending malformed grids
@@ -330,60 +299,20 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
 
-      // Build a compact payload: palette + 256-char map (one char per cell)
-      // This reduces JSON size dramatically compared to full strings.
-      const palette = [];
-      const paletteIndex = {};
-      // Build a map from hex (data-color) to the button title (color name)
-      const colorNameMap = {};
-      colorButtons.forEach(btn => {
-        const col = (btn.getAttribute('data-color') || '').toLowerCase();
-        const title = btn.getAttribute('title') || btn.title || '';
-        if (col) colorNameMap[col] = title || col;
-      });
-      function idxChar(i) {
-        const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-        return chars[i] || '?';
-      }
-      function ensurePalette(color) {
-        if (color === null) return null;
-        const key = (typeof color === 'string') ? color.toLowerCase() : color;
-        // Prefer to send the color name (button title) when available
-        const name = (typeof key === 'string' && colorNameMap.hasOwnProperty(key)) ? colorNameMap[key] : null;
-        const paletteKey = name || key;
-        if (paletteIndex.hasOwnProperty(paletteKey)) return paletteIndex[paletteKey];
-        const i = palette.length;
-        palette.push(name || color);
-        paletteIndex[paletteKey] = i;
-        return i;
-      }
-      let compact = ''; // length should be gridSize*gridSize (256)
-      for (let r = 0; r < gridSize; r++) {
-        for (let c = 0; c < gridSize; c++) {
-          const v = state[r][c];
-          if (v === null) compact += '.';
-          else {
-            const i = ensurePalette(v);
-            compact += idxChar(i);
-          }
-        }
-      }
-      const payload = { compact, palette };
-      const payloadStr = JSON.stringify(payload);
-      console.log('Sending grid to ESP at', espIp);
-      console.debug('Grid payload:', payloadStr);
-
-      const originalText = sendBtn.textContent;
-      sendBtn.textContent = 'Sending...';
-      sendBtn.disabled = true;
+      // Build a compact payload, not taking different colors into account
+      // and only sending filled vs empty cells.
+      const simpleCompact = state.map(row => row.map(v => (v === null ? '0' : '1')).join('')).join('');
+      console.log('Simple compact grid:', simpleCompact);
+      const payloadSimple = { compact: simpleCompact };
+      console.log('Simple payload:', JSON.stringify(payloadSimple));
 
       try {
-        // Try default (may include port if user typed ip:port)
+        // Try default
         let postUrls = [];
-        if (espIp.includes(':')) postUrls.push(`http://${espIp}/grid`);
+        if (espIp.includes(':')) postUrls.push(`http://${espIp}/grid-simple`);
         else {
-          postUrls.push(`http://${espIp}/grid`);
-          postUrls.push(`http://${espIp}:8080/grid`);
+          postUrls.push(`http://${espIp}/grid-simple`);
+          postUrls.push(`http://${espIp}:8080/grid-simple`);
         }
 
         let res = null;
@@ -393,7 +322,7 @@ document.addEventListener('DOMContentLoaded', () => {
             res = await fetch(url, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: payloadStr
+              body: JSON.stringify(payloadSimple)
             });
             if (res.ok) break; // success
             // read server error body when available
@@ -405,17 +334,9 @@ document.addEventListener('DOMContentLoaded', () => {
             res = null;
           }
         }
-
-        if (!res || !res.ok) throw lastErr || new Error('Failed to POST to any URL');
-        let json = null;
-        try { json = await res.json(); } catch (e) { json = { status: 'ok' }; }
-        console.log('ESP response', json);
-        sendBtn.textContent = 'Sent ✓';
-        setTimeout(() => { sendBtn.textContent = originalText; sendBtn.disabled = false; }, 1200);
-      } catch (err) {
-        console.error('Failed to send grid to ESP:', err);
-        sendBtn.textContent = 'Failed';
-        setTimeout(() => { sendBtn.textContent = originalText; sendBtn.disabled = false; }, 1500);
+      }
+      catch (err) {
+        console.error('Failed to send simple grid to ESP:', err);
       }
     });
   }

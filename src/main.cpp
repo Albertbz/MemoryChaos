@@ -1,42 +1,42 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
-#include <WebSocketsServer.h>
 #include <WiFi.h>
 
 #include <algorithm>
 #include <cstring>
 #include <vector>
 
-#define GPIO 2    // Pin for the electromagnet
-#define BUTTON 4  // Pin for the button
+// NOTE: avoid using GPIOs 34-39 (input-only) and 6-11 (flash) on ESP32.
+// Use only output-capable pins here.
+const int LED_ROWS[] = {13, 12, 14, 27, 26};
+// Replaced input-only pins (34,35) with safe output-capable pins
+const int LED_COLS[] = {25, 33, 32, 23, 19};
+const int LED_MATRIX_COUNT = 5;
+const int SPEAKER_PIN = 15;
+const int RELAY_PINS[] = {2, 4};
 
-// LED pins the user wants to control
-const int LED_PINS[] = {13, 12, 14};
-const int RELAY_PINS[] = {15, 2};
-const size_t LED_PIN_COUNT = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
+int pixel = 0;
+bool countDownInProgress = false;
+int timeBetweenBeeps = 0;
+static unsigned long countdownStart = 0;
+static unsigned long timeUntilNextStage = 10000;
+const int pixelDelay = 1;  // milliseconds
 
-bool isAllowedLedPin(int pin) {
-    for (size_t i = 0; i < LED_PIN_COUNT; ++i)
-        if (LED_PINS[i] == pin) return true;
-    return false;
-}
-
-void handleLed();
+std::vector<std::vector<int>> activePixels;
+std::vector<std::vector<int>> prevActivePixels;
 
 // Replace with your own network credentials (kept from original)
-const char* ssid = "OnePlus 8";
-const char* password = "Streym2002";
+const char* ssid = "Alberts iPhone 15 Pro";
+const char* password = "tingting";
 
 WebServer server(80);
-WebSocketsServer webSocket = WebSocketsServer(81);
 
 const int GRID_SIZE = 16;
 String gridState[GRID_SIZE][GRID_SIZE];
 
-// Forward declarations
-void printGridToSerial();
-String normalizeColorString(const String& in);
+// Forward
+void setCountdownBeeps(bool activate, int _timeBetweenBeeps);
 
 void sendCorsHeaders() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -49,37 +49,122 @@ void handleOptions() {
     server.send(204);
 }
 
-// Scan the gridState and turn on LEDs for colors that are present.
-// Mapping: pin 13 -> red, pin 12 -> blue, pin 14 -> yellow
-void updateLedsFromGrid() {
-    // Only use the incoming color names (e.g. "Red", "Blue", "Yellow")
-    // to decide which LEDs to light. This assumes the client sends names for
-    // both compact palettes and websocket cell updates.
-    bool redUsed = false;
-    bool blueUsed = false;
-    bool yellowUsed = false;
-
-    for (int r = 0; r < GRID_SIZE; ++r) {
-        for (int c = 0; c < GRID_SIZE; ++c) {
-            const String& s = gridState[r][c];
-            if (s.length() == 0) continue;
-            String low = s;
-            low.toLowerCase();
-            if (low.indexOf("red") >= 0) redUsed = true;
-            if (low.indexOf("blue") >= 0) blueUsed = true;
-            if (low.indexOf("yellow") >= 0) yellowUsed = true;
-            if (redUsed && blueUsed && yellowUsed) break;
-        }
-        if (redUsed && blueUsed && yellowUsed) break;
+void handleSimpleGrid() {
+    sendCorsHeaders();
+    String body = server.arg("plain");
+    if (body.length() == 0) {
+        server.send(400, "text/plain", "Empty body");
+        return;
     }
 
-    digitalWrite(LED_PINS[0], redUsed ? HIGH : LOW);
-    digitalWrite(LED_PINS[1], blueUsed ? HIGH : LOW);
-    digitalWrite(LED_PINS[2], yellowUsed ? HIGH : LOW);
+    // Protect against extremely large payloads
+    if (body.length() > 32768) {
+        server.send(413, "text/plain", "Payload too large");
+        Serial.printf("Rejected POST /grid-simple: payload %u bytes > limit\n",
+                      (unsigned)body.length());
+        return;
+    }
 
-    Serial.printf("updateLedsFromGrid -> red:%s blue:%s yellow:%s\n",
-                  redUsed ? "ON" : "OFF", blueUsed ? "ON" : "OFF",
-                  yellowUsed ? "ON" : "OFF");
+    // Parse JSON body expecting { "compact": "0101..." }
+    size_t capacity = std::max((size_t)256, (size_t)body.length() * 2);
+    if (capacity > 65536) capacity = 65536;
+    DynamicJsonDocument doc(capacity);
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        if (err == DeserializationError::NoMemory) {
+            Serial.println("JSON parse error in /grid-simple: NoMemory");
+            server.send(
+                413, "text/plain",
+                String("JSON parse error: NoMemory - reduce payload size"));
+            return;
+        }
+        Serial.print("JSON parse error in /grid-simple: ");
+        Serial.println(err.c_str());
+        server.send(400, "text/plain",
+                    String("JSON parse error: ") + err.c_str());
+        return;
+    }
+
+    if (!doc.containsKey("compact") || !doc["compact"].is<const char*>()) {
+        server.send(400, "text/plain", "Missing or invalid 'compact' property");
+        return;
+    }
+
+    const char* comp = doc["compact"];
+    if (!comp) {
+        server.send(400, "text/plain", "compact must be a string");
+        return;
+    }
+    String compStr = String(comp);
+
+    // Clear entire grid first to avoid stale cells
+    for (int r = 0; r < GRID_SIZE; ++r) {
+        for (int c = 0; c < GRID_SIZE; ++c) gridState[r][c] = "";
+    }
+
+    // If client sent a 5x5 compact string (LED_MATRIX_COUNT^2), map it to
+    // the top-left region of the 16x16 grid. If a full 16x16 (256) string
+    // is sent, populate the full grid.
+    size_t smallSz = (size_t)LED_MATRIX_COUNT * (size_t)LED_MATRIX_COUNT;
+    size_t bigSz = (size_t)GRID_SIZE * (size_t)GRID_SIZE;
+
+    if (compStr.length() == smallSz) {
+        for (size_t i = 0; i < smallSz; ++i) {
+            char ch = compStr.charAt(i);
+            if (ch != '0' && ch != '1') {
+                server.send(400, "text/plain",
+                            "compact must contain only '0' and '1'");
+                return;
+            }
+            int r = i / LED_MATRIX_COUNT;
+            int c = i % LED_MATRIX_COUNT;
+            if (ch == '1') {
+                // Presence-only payload: use a simple marker color (white)
+                gridState[r][c] = "#ffffff";
+            } else {
+                gridState[r][c] = "";
+            }
+        }
+        // Update the activePixels vector used by the main loop so the
+        // hardware will be driven according to the 5x5 compact payload.
+        activePixels.clear();
+        for (size_t i = 0; i < smallSz; ++i) {
+            char ch = compStr.charAt(i);
+            if (ch == '1') {
+                int r = (int)(i / LED_MATRIX_COUNT);
+                int c = (int)(i % LED_MATRIX_COUNT);
+                // push row/col pair
+                activePixels.push_back({r, c});
+            }
+        }
+
+        server.send(200, "application/json", "{\"status\":\"ok\"}");
+
+        // Wait for 5 seconds, then start the countdown beeps
+        countdownStart = millis();
+
+        return;
+    } else if (compStr.length() == bigSz) {
+        // Treat any non-'0' as filled
+        for (size_t i = 0; i < bigSz; ++i) {
+            char ch = compStr.charAt(i);
+            int r = i / GRID_SIZE;
+            int c = i % GRID_SIZE;
+            if (ch == '0') {
+                gridState[r][c] = "";
+            } else {
+                gridState[r][c] = "#ffffff";
+            }
+        }
+        server.send(200, "application/json", "{\"status\":\"ok\"}");
+        return;
+    } else {
+        Serial.printf("POST /grid-simple wrong length: %u\n",
+                      (unsigned)compStr.length());
+        server.send(400, "text/plain",
+                    "compact string must be 25 (5x5) or 256 (16x16) chars");
+        return;
+    }
 }
 
 // Make a POST /push-magnets handler that activates the relays
@@ -97,197 +182,6 @@ void handlePushMagnets() {
     Serial.println("POST /push-magnets: Magnets pushed");
 }
 
-void handleGridPost() {
-    sendCorsHeaders();
-
-    String body = server.arg("plain");
-    if (body.length() == 0) {
-        server.send(400, "text/plain", "Empty body");
-        return;
-    }
-
-    // Protect against extremely large payloads that can exhaust RAM/stack
-    if (body.length() > 32768) {
-        server.send(413, "text/plain", "Payload too large");
-        Serial.printf("Rejected POST /grid: payload %u bytes > limit\n",
-                      (unsigned)body.length());
-        return;
-    }
-
-    // Use a DynamicJsonDocument sized from the incoming payload to avoid
-    // allocating large static buffers on the stack (which can cause crashes).
-    size_t capacity = std::max((size_t)4096, (size_t)body.length() * 2);
-    if (capacity > 65536) capacity = 65536;
-    DynamicJsonDocument doc(capacity);
-    DeserializationError err = deserializeJson(doc, body);
-    if (err) {
-        // If there wasn't enough memory to parse, return a distinct 413 so the
-        // client can take action (shorten payload / send hex colors / reduce
-        // size).
-        if (err == DeserializationError::NoMemory) {
-            Serial.println("JSON parse error in /grid: NoMemory");
-            server.send(413, "text/plain",
-                        String("JSON parse error: NoMemory - increase "
-                               "allocation or reduce payload size"));
-            return;
-        }
-        server.send(400, "text/plain",
-                    String("JSON parse error: ") + err.c_str());
-        Serial.print("JSON parse error in /grid: ");
-        Serial.println(err.c_str());
-        return;
-    }
-
-    // --- Support compact payloads early: { "compact": "..256chars..",
-    // "palette": ["#ffffff",...] }
-    if (doc.containsKey("compact") && doc["compact"].is<const char*>()) {
-        const char* comp = doc["compact"];
-        if (!comp) {
-            server.send(400, "text/plain", "compact must be a string");
-            return;
-        }
-        String compStr = String(comp);
-        if (compStr.length() != GRID_SIZE * GRID_SIZE) {
-            Serial.printf("POST /grid compact wrong length: %u\n",
-                          (unsigned)compStr.length());
-            server.send(400, "text/plain", "compact string must be 256 chars");
-            return;
-        }
-        // palette optional
-        std::vector<String> pal;
-        if (doc.containsKey("palette") && doc["palette"].is<JsonArray>()) {
-            JsonArray parr = doc["palette"].as<JsonArray>();
-            for (size_t i = 0; i < parr.size(); ++i) {
-                if (parr[i].is<const char*>()) {
-                    String raw = String((const char*)parr[i]);
-                    // Normalize palette entries: prefer mapping names to hex
-                    String norm = normalizeColorString(raw);
-                    pal.push_back(norm);
-                } else {
-                    pal.push_back(String(""));
-                }
-            }
-        }
-
-        auto decodeIndex = [](char ch) -> int {
-            const char* chars =
-                "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxy"
-                "z";
-            const char* p = strchr(chars, ch);
-            if (!p) return -1;
-            return (int)(p - chars);
-        };
-
-        for (int i = 0; i < GRID_SIZE * GRID_SIZE; ++i) {
-            char ch = compStr.charAt(i);
-            int r = i / GRID_SIZE;
-            int c = i % GRID_SIZE;
-            if (ch == '.') {
-                gridState[r][c] = "";
-            } else {
-                int idx = decodeIndex(ch);
-                if (idx < 0 || (size_t)idx >= pal.size()) {
-                    Serial.printf(
-                        "POST /grid compact unknown palette idx %d at pos %d\n",
-                        idx, i);
-                    server.send(400, "text/plain",
-                                "compact contains invalid palette index");
-                    return;
-                }
-                const String col = pal[idx];
-                if (col.length() > 64) {
-                    Serial.printf(
-                        "POST /grid compact palette string too long idx %d len "
-                        "%u\n",
-                        idx, (unsigned)col.length());
-                    server.send(400, "text/plain", "palette string too long");
-                    return;
-                }
-                gridState[r][c] = col;
-            }
-        }
-
-        printGridToSerial();
-        updateLedsFromGrid();
-        server.send(200, "application/json", "{\"status\":\"ok\"}");
-        return;
-    }
-
-    if (!doc.containsKey("grid")) {
-        Serial.println("POST /grid missing 'grid' property");
-        server.send(400, "text/plain", "Missing 'grid' property");
-        return;
-    }
-
-    if (!doc.containsKey("grid") || !doc["grid"].is<JsonArray>()) {
-        Serial.println("POST /grid 'grid' not an array");
-        server.send(400, "text/plain", "'grid' must be an array");
-        return;
-    }
-
-    JsonArray grid = doc["grid"].as<JsonArray>();
-    if ((int)grid.size() != GRID_SIZE) {
-        Serial.printf("POST /grid wrong row count: %u\n",
-                      (unsigned)grid.size());
-        server.send(400, "text/plain", "'grid' must have 16 rows");
-        return;
-    }
-
-    for (int r = 0; r < GRID_SIZE; ++r) {
-        if (!grid[r].is<JsonArray>()) {
-            Serial.printf("POST /grid row %d not an array\n", r);
-            server.send(400, "text/plain", "Each grid row must be an array");
-            return;
-        }
-        JsonArray row = grid[r].as<JsonArray>();
-        if ((int)row.size() != GRID_SIZE) {
-            Serial.printf("POST /grid row %d wrong column count: %u\n", r,
-                          (unsigned)row.size());
-            server.send(400, "text/plain",
-                        "Each grid row must have 16 columns");
-            return;
-        }
-        for (int c = 0; c < GRID_SIZE; ++c) {
-            if (row[c].isNull()) {
-                gridState[r][c] = "";
-            } else if (row[c].is<const char*>()) {
-                const char* s = row[c];
-                // Optional: limit string length to avoid enormous allocations
-                if (strlen(s) > 64) {
-                    Serial.printf(
-                        "POST /grid row %d col %d color string too long (%u)\n",
-                        r, c, (unsigned)strlen(s));
-                    server.send(400, "text/plain", "Color string too long");
-                    return;
-                }
-                String col = String(s);
-                // Normalize color names like "Red" -> "#e53935", and normalize
-                // hex
-                col = normalizeColorString(col);
-                gridState[r][c] = col;
-            } else {
-                // Not a string or null
-                Serial.printf("POST /grid row %d col %d invalid value type\n",
-                              r, c);
-                server.send(400, "text/plain",
-                            "Grid values must be strings or null");
-                return;
-            }
-        }
-    }
-
-    Serial.println("Received grid:");
-    for (int r = 0; r < GRID_SIZE; ++r) {
-        String line = "";
-        for (int c = 0; c < GRID_SIZE; ++c) {
-            line += gridState[r][c].length() ? "X" : ".";
-        }
-        Serial.println(line);
-    }
-    updateLedsFromGrid();
-    server.send(200, "application/json", "{\"status\":\"ok\"}");
-}
-
 // Simple status endpoint to help the web client perform reachability checks
 void handleStatus() {
     sendCorsHeaders();
@@ -302,268 +196,19 @@ void handleStatus() {
     }
 }
 
-// Return the color associated with an LED pin
-const char* getLedColorName(int pin) {
-    if (pin == 13) return "red";
-    if (pin == 12) return "blue";
-    if (pin == 14) return "yellow";
-    return "unknown";
-}
-
-// Normalize color strings: map known color names to canonical hex used by the
-// client, normalize hex to lowercase and expand short form (#RGB) to #RRGGBB.
-String normalizeColorString(const String& in) {
-    String s = in;
-    s.trim();
-    if (s.length() == 0) return s;
-    // If hex, normalize to lowercase and expand short form
-    if (s.charAt(0) == '#') {
-        s.toLowerCase();
-        if (s.length() == 4) {
-            // #RGB -> #RRGGBB
-            char r = s.charAt(1);
-            char g = s.charAt(2);
-            char b = s.charAt(3);
-            String out = "#";
-            out += String(r);
-            out += String(r);
-            out += String(g);
-            out += String(g);
-            out += String(b);
-            out += String(b);
-            out.toLowerCase();
-            return out;
-        }
-        return s;
-    }
-    // For non-hex input (e.g. "Red", "Blue"), preserve the incoming value
-    // as-is (trimmed). This lets the incoming palette use names instead of
-    // being converted to hex.
-    return s;
-}
-
-// HTTP handler for /led
-void handleLed() {
-    sendCorsHeaders();
-
-    // If no pin specified, return the list of managed pins and their states
-    if (!server.hasArg("pin") && server.method() == HTTP_GET) {
-        DynamicJsonDocument resp(1024);
-        JsonArray arr = resp.to<JsonArray>();
-        for (size_t i = 0; i < LED_PIN_COUNT; ++i) {
-            int pin = LED_PINS[i];
-            JsonObject obj = arr.createNestedObject();
-            obj["pin"] = pin;
-            obj["color"] = getLedColorName(pin);
-            obj["state"] = (digitalRead(pin) == HIGH) ? "on" : "off";
-        }
-        String out;
-        serializeJson(arr, out);
-        server.send(200, "application/json", out);
-        return;
-    }
-
-    // Determine pin from query param or JSON body
-    int pin = -1;
-    String stateStr = "";
-
-    if (server.hasArg("pin")) {
-        pin = server.arg("pin").toInt();
-        if (server.hasArg("state")) stateStr = server.arg("state");
-    } else {
-        // Try JSON body
-        String body = server.arg("plain");
-        if (body.length() > 0) {
-            size_t cap = std::max((size_t)256, (size_t)body.length() * 2);
-            if (cap > 2048) cap = 2048;
-            DynamicJsonDocument doc(cap);
-            DeserializationError err = deserializeJson(doc, body);
-            if (!err) {
-                if (doc.containsKey("pin")) pin = doc["pin"] | -1;
-                if (doc.containsKey("state") && doc["state"].is<const char*>())
-                    stateStr = String((const char*)doc["state"]);
-            }
-        }
-    }
-
-    if (pin < 0 || !isAllowedLedPin(pin)) {
-        server.send(400, "text/plain",
-                    "Invalid or missing 'pin' (allowed: 13,12,14)");
-        return;
-    }
-
-    // If no state provided, toggle
-    if (stateStr.length() == 0) {
-        int cur = digitalRead(pin);
-        int nw = (cur == HIGH) ? LOW : HIGH;
-        digitalWrite(pin, nw);
-    } else {
-        String s = stateStr;
-        s.toLowerCase();
-        if (s == "on" || s == "1" || s == "true") {
-            digitalWrite(pin, HIGH);
-        } else if (s == "off" || s == "0" || s == "false") {
-            digitalWrite(pin, LOW);
-        } else if (s == "toggle") {
-            int cur = digitalRead(pin);
-            digitalWrite(pin, (cur == HIGH) ? LOW : HIGH);
-        } else {
-            server.send(400, "text/plain",
-                        "Invalid state value (use on/off/toggle)");
-            return;
-        }
-    }
-
-    // Respond with the current state
-    DynamicJsonDocument resp(256);
-    resp["pin"] = pin;
-    resp["color"] = getLedColorName(pin);
-    resp["state"] = (digitalRead(pin) == HIGH) ? "on" : "off";
-    String out;
-    serializeJson(resp, out);
-    server.send(200, "application/json", out);
-}
-
-// Helper to print grid (used from websocket handlers too)
-void printGridToSerial() {
-    // Build palette of unique non-empty colors in gridState so we can print
-    // indices
-    std::vector<String> palette;
-    for (int r = 0; r < GRID_SIZE; ++r) {
-        for (int c = 0; c < GRID_SIZE; ++c) {
-            const String& s = gridState[r][c];
-            if (s.length() == 0) continue;
-            bool found = false;
-            for (size_t i = 0; i < palette.size(); ++i) {
-                if (palette[i] == s) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) palette.push_back(s);
-        }
-    }
-
-    Serial.println(
-        "Grid state (numbers refer to palette indices, '.' is empty):");
-    for (int r = 0; r < GRID_SIZE; ++r) {
-        String line = "";
-        for (int c = 0; c < GRID_SIZE; ++c) {
-            const String& s = gridState[r][c];
-            if (s.length() == 0) {
-                line += ". ";
-            } else {
-                int idx = -1;
-                for (size_t i = 0; i < palette.size(); ++i)
-                    if (palette[i] == s) {
-                        idx = (int)i;
-                        break;
-                    }
-                if (idx < 0) {
-                    line += "? ";
-                } else {
-                    if (idx < 10)
-                        line += String(idx) + " ";
-                    else
-                        line += String(idx) + " ";
-                }
-            }
-        }
-        Serial.println(line);
-    }
-
-    if (!palette.empty()) {
-        Serial.print("Palette: ");
-        for (size_t i = 0; i < palette.size(); ++i) {
-            // print like 0=#ffffff, 1=#000000
-            Serial.printf("%u=%s", (unsigned)i, palette[i].c_str());
-            if (i + 1 < palette.size()) Serial.print(", ");
-        }
-        Serial.println();
-    }
-}
-
-// Handle incoming websocket messages (text)
-void onWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t* payload,
-                      size_t length) {
-    if (type == WStype_TEXT) {
-        // Basic safety: reject absurdly large messages to avoid exhausting heap
-        Serial.printf("WS incoming text length=%u\n", (unsigned)length);
-        if (length == 0 || length > 16384) {
-            Serial.println("WS message too large or empty, ignoring");
-            return;
-        }
-
-        String msg = String((char*)payload);
-        // Expect messages like: {"type":"cell","r":1,"c":2,"color":"#ffffff"}
-        // or {"type":"full","grid":[...]}
-        // Use a dynamic document sized from the incoming payload to avoid
-        // stack/heap corruption.
-        size_t capacity = std::max((size_t)2048, length * 2);
-        if (capacity < 4096) capacity = 4096;
-        if (capacity > 32768) capacity = 32768;
-        DynamicJsonDocument doc(capacity);
-        DeserializationError err = deserializeJson(doc, msg);
-        if (err) {
-            Serial.print("WS JSON parse error: ");
-            Serial.println(err.c_str());
-            return;
-        }
-
-        const char* typeStr = doc["type"] | "";
-        if (strcmp(typeStr, "cell") == 0) {
-            int r = doc["r"] | -1;
-            int c = doc["c"] | -1;
-            if (r >= 0 && c >= 0 && r < GRID_SIZE && c < GRID_SIZE) {
-                if (doc["color"].isNull()) {
-                    gridState[r][c] = "";
-                } else {
-                    String col = String((const char*)doc["color"]);
-                    col = normalizeColorString(col);
-                    gridState[r][c] = col;
-                }
-                // For feedback, print the updated row
-                Serial.printf("WS cell update: r=%d c=%d color=%s\n", r, c,
-                              gridState[r][c].c_str());
-                // Update LEDs because a cell changed
-                updateLedsFromGrid();
-            }
-        } else if (strcmp(typeStr, "full") == 0) {
-            if (!doc.containsKey("grid")) return;
-            JsonArray grid = doc["grid"].as<JsonArray>();
-            for (int r = 0; r < GRID_SIZE; ++r) {
-                JsonArray row = grid[r].as<JsonArray>();
-                for (int c = 0; c < GRID_SIZE; ++c) {
-                    if (row[c].isNull())
-                        gridState[r][c] = "";
-                    else
-                        gridState[r][c] = String((const char*)row[c]);
-                }
-            }
-            printGridToSerial();
-            updateLedsFromGrid();
-        }
-    }
-}
-
 void setup() {
     Serial.begin(115200);
-    pinMode(GPIO, OUTPUT);
-    pinMode(BUTTON, INPUT);
 
-    // Initialize LED pins
-    for (size_t i = 0; i < LED_PIN_COUNT; ++i) {
-        pinMode(LED_PINS[i], OUTPUT);
-        digitalWrite(LED_PINS[i], LOW);
+    // Initialize LED rows and columns
+    for (size_t i = 0; i < LED_MATRIX_COUNT; i++) {
+        pinMode(LED_ROWS[i], OUTPUT);
+        pinMode(LED_COLS[i], OUTPUT);
+        digitalWrite(LED_ROWS[i], LOW);
+        digitalWrite(LED_COLS[i], HIGH);
     }
 
-    pinMode(RELAY_PINS[0], OUTPUT);
-    pinMode(RELAY_PINS[1], OUTPUT);
-
-    digitalWrite(RELAY_PINS[0], HIGH);
-    digitalWrite(RELAY_PINS[1], HIGH);
-    digitalWrite(RELAY_PINS[0], LOW);
-    digitalWrite(RELAY_PINS[1], LOW);
+    // Initialize speaker pin
+    pinMode(SPEAKER_PIN, OUTPUT);
 
     WiFi.mode(WIFI_STA);
     WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -590,33 +235,127 @@ void setup() {
         Serial.println(WiFi.localIP());
 
         // Start HTTP server routes after WiFi is up
-        server.on("/grid", HTTP_OPTIONS, handleOptions);
-        server.on("/grid", HTTP_POST, handleGridPost);
+        server.on("/grid-simple", HTTP_OPTIONS, handleOptions);
+        server.on("/grid-simple", HTTP_POST, handleSimpleGrid);
         server.on("/push-magnets", HTTP_POST, handlePushMagnets);
-        server.on("/led", HTTP_GET, handleLed);
-        server.on("/led", HTTP_POST, handleLed);
         server.on("/status", HTTP_GET, handleStatus);
         server.begin();
         Serial.println("HTTP server started");
 
-        // Start WebSocket server
-        webSocket.begin();
-        webSocket.onEvent(onWebSocketEvent);
-        Serial.println("WebSocket server started on port 81");
     } else {
         Serial.println(
             "WiFi connect timed out — servers not started. Check "
             "credentials/network.");
         // Still set up routes so HTTP might work if IP becomes available later
-        server.on("/grid", HTTP_OPTIONS, handleOptions);
-        server.on("/grid", HTTP_POST, handleGridPost);
+        server.on("/grid-simple", HTTP_OPTIONS, handleOptions);
+        server.on("/grid-simple", HTTP_POST, handleSimpleGrid);
         server.on("/status", HTTP_GET, handleStatus);
     }
 }
 
+void turnOnRowCol(int row, int col) {
+    digitalWrite(LED_ROWS[row], HIGH);
+    digitalWrite(LED_COLS[col], LOW);
+}
+
+void turnOffRowCol(int row, int col) {
+    digitalWrite(LED_ROWS[row], LOW);
+    digitalWrite(LED_COLS[col], HIGH);
+}
+
+void setCountdownBeeps(bool activate, int _timeBetweenBeeps) {
+    if (activate && !countDownInProgress) {
+        countDownInProgress = true;
+        timeBetweenBeeps = _timeBetweenBeeps;
+    } else if (!activate && countDownInProgress) {
+        countDownInProgress = false;
+        timeBetweenBeeps = _timeBetweenBeeps;
+    }
+}
+
 void loop() {
+    // If countdown is not 0, meaning it has been set to start, then check
+    // whether 5 seconds have passed
+    if (countdownStart != 0 && millis() - countdownStart > 5000) {
+        countdownStart = 0;
+        // Copy current activePixels to prevActivePixels
+        prevActivePixels = activePixels;
+        // and clear activePixels
+        activePixels.clear();
+        setCountdownBeeps(true, 8000);
+    }
+
+    // Activate and deactivate pixels in ActivePixels vector so
+    // that the LED matrix shows the desired pattern.
+    for (auto& p : activePixels) {
+        int row = p[0];
+        int col = p[1];
+        turnOnRowCol(row, col);
+        delay(pixelDelay);
+        turnOffRowCol(row, col);
+    }
+
+    if (countDownInProgress) {
+        static unsigned long lastBeep = 0;
+        if (millis() - lastBeep > timeBetweenBeeps) {
+            lastBeep = millis();
+            Serial.print("Beep");
+            tone(SPEAKER_PIN, 300);
+            delay(100);
+            noTone(SPEAKER_PIN);
+        }
+
+        static unsigned long lastChange = 0;
+        if (millis() - lastChange > timeUntilNextStage) {
+            lastChange = millis();
+            switch (timeBetweenBeeps) {
+                case 8000: {
+                    timeBetweenBeeps = 4000;
+                    break;
+                }
+                case 4000: {
+                    timeBetweenBeeps = 2000;
+                    break;
+                }
+                case 2000: {
+                    timeBetweenBeeps = 1000;
+                    break;
+                }
+                case 1000: {
+                    timeBetweenBeeps = 500;
+                    break;
+                }
+                case 500: {
+                    timeBetweenBeeps = 250;
+                    timeUntilNextStage = 5000;
+                    break;
+                }
+                case 250: {
+                    timeBetweenBeeps = 125;
+                    break;
+                }
+                case 125: {
+                    tone(SPEAKER_PIN, 200);
+                    delay(2000);
+                    noTone(SPEAKER_PIN);
+                    tone(SPEAKER_PIN, 500);
+                    delay(100);
+                    noTone(SPEAKER_PIN);
+                    setCountdownBeeps(false, 0);
+                    activePixels = prevActivePixels;
+                    timeUntilNextStage = 10000;
+                    break;
+                }
+            }
+        }
+    }
+
+    // tone(SPEAKER_PIN, 440);  // Play tone at 440 Hz
+    // delay(100);              // for 100 milliseconds
+    // noTone(SPEAKER_PIN);     // Stop the tone
+    // delay(1000);
+
     server.handleClient();
-    webSocket.loop();
 
     // Periodic status output to help debugging connectivity
     static unsigned long lastPrint = 0;
